@@ -2,6 +2,7 @@ import os
 import io
 import cv2
 import numpy as np
+import base64
 from flask import Flask, request, jsonify, send_file
 import tensorflow as tf
 
@@ -65,13 +66,28 @@ def build_feature_channels(image_bgr, target_size=(256, 256)):
     )
     return feat, img_bgr
 
-def mask_to_png_bytes(mask_uint8):
+# -------------------------
+# Output helpers
+# -------------------------
+def mask_to_png_bytes(mask_uint8: np.ndarray) -> bytes:
     ok, buf = cv2.imencode(".png", mask_uint8)
     if not ok:
         raise RuntimeError("Failed to encode mask as PNG")
     return buf.tobytes()
 
-def overlay_mask_on_image(image_bgr, mask_uint8, alpha=0.45):
+def mask_to_base64_raw(mask_uint8: np.ndarray) -> str:
+    # raw H*W uint8 bytes -> base64
+    return base64.b64encode(mask_uint8.tobytes(order="C")).decode("utf-8")
+
+def mask_to_pixel_matrix(mask_uint8: np.ndarray):
+    # 2D list (H x W) of class ids
+    return mask_uint8.tolist()
+
+def mask_to_pixel_flat(mask_uint8: np.ndarray):
+    # flat list (H*W) of class ids in row-major order
+    return mask_uint8.flatten(order="C").astype(int).tolist()
+
+def overlay_mask_on_image(image_bgr: np.ndarray, mask_uint8: np.ndarray, alpha=0.45):
     palette = np.array([
         [0, 0, 0],
         [0, 255, 0],
@@ -85,9 +101,9 @@ def overlay_mask_on_image(image_bgr, mask_uint8, alpha=0.45):
         [128, 255, 128],
     ], dtype=np.uint8)
 
-    color_mask = palette[np.clip(mask_uint8, 0, len(palette)-1)]
-    blended = cv2.addWeighted(image_bgr, 1.0, color_mask, alpha, 0)
-    return blended
+    color_mask = palette[np.clip(mask_uint8, 0, len(palette) - 1)]
+    blended = cv2.addWeighted(image_bgr, 1.0, color_mask, float(alpha), 0)
+    return blended, palette
 
 # -------------------------
 # Flask setup
@@ -97,7 +113,6 @@ app = Flask(__name__)
 INPUT_H = int(os.environ.get("INPUT_H", "256"))
 INPUT_W = int(os.environ.get("INPUT_W", "256"))
 
-# Set these paths via env vars if you want
 TREE_MODEL_PATH = os.environ.get("TREE_MODEL_PATH", "saved_models2/tree_unet_segmentation.h5")
 OBST_MODEL_PATH = os.environ.get("OBST_MODEL_PATH", "saved_models2/obstacle_unet_segmentation.h5")
 
@@ -106,14 +121,14 @@ custom_objects = {
     "dice_coef_multiclass": dice_coef_multiclass,
 }
 
-# Load BOTH models once (fast inference)
+# Load models once
 tree_model = tf.keras.models.load_model(TREE_MODEL_PATH, custom_objects=custom_objects, compile=False)
 obst_model = tf.keras.models.load_model(OBST_MODEL_PATH, custom_objects=custom_objects, compile=False)
 
 MODELS = {
     "tree": tree_model,
     "obstruction": obst_model,
-    "obstacle": obst_model,   # alias
+    "obstacle": obst_model,  # alias
 }
 
 @app.get("/health")
@@ -130,23 +145,29 @@ def health():
 def predict():
     """
     Query params:
-      - model: roof | obstruction (default: roof)
+      - model: tree | obstruction | obstacle (default: tree)
+      - response: image | json | pixel (default: image)
+          * image: returns PNG (mask or overlay)
+          * json : returns compact base64 raw bytes of mask
+          * pixel: returns pixel-level JSON (matrix or flat)
+      - pixel_format: matrix | flat (default: matrix)   [only when response=pixel]
 
     Form-data:
       - file: image
-      - output: mask | overlay (default: mask)
+      - output: mask | overlay (default: mask)   [only when response=image]
+      - alpha: float (default: 0.45)             [only when output=overlay]
     """
-    model_key = request.args.get("model", "roof").lower().strip()
+    model_key = request.args.get("model", "tree").lower().strip()
     model = MODELS.get(model_key)
     if model is None:
         return jsonify({"error": f"invalid model '{model_key}'. Use one of: {sorted(MODELS.keys())}"}), 400
 
+    response_mode = request.args.get("response", "image").lower().strip()
+    if response_mode not in ("image", "json", "pixel"):
+        return jsonify({"error": "response must be 'image' or 'json' or 'pixel'"}), 400
+
     if "file" not in request.files:
         return jsonify({"error": "missing file field"}), 400
-
-    output = request.form.get("output", "mask").lower().strip()
-    if output not in ("mask", "overlay"):
-        return jsonify({"error": "output must be 'mask' or 'overlay'"}), 400
 
     data = request.files["file"].read()
     if not data:
@@ -163,6 +184,49 @@ def predict():
     y = model.predict(x, verbose=0)  # (1,H,W,C)
     mask = np.argmax(y[0], axis=-1).astype(np.uint8)  # (H,W)
 
+    # -------- JSON mode (compact base64 bytes) --------
+    if response_mode == "json":
+        return jsonify({
+            "model": model_key,
+            "input_size": {"h": int(INPUT_H), "w": int(INPUT_W)},
+            "mask": {
+                "encoding": "raw_u8_base64",
+                "shape": [int(mask.shape[0]), int(mask.shape[1])],
+                "data": mask_to_base64_raw(mask),
+                "dtype": "uint8",
+                "order": "C",
+            }
+        })
+
+    # -------- PIXEL mode (pixel-level JSON) --------
+    if response_mode == "pixel":
+        pixel_format = request.args.get("pixel_format", "matrix").lower().strip()
+        if pixel_format not in ("matrix", "flat"):
+            return jsonify({"error": "pixel_format must be 'matrix' or 'flat'"}), 400
+
+        if pixel_format == "matrix":
+            pixel_data = mask_to_pixel_matrix(mask)
+        else:
+            pixel_data = mask_to_pixel_flat(mask)
+
+        return jsonify({
+            "model": model_key,
+            "input_size": {"h": int(INPUT_H), "w": int(INPUT_W)},
+            "mask": {
+                "encoding": "pixel_json",
+                "shape": [int(mask.shape[0]), int(mask.shape[1])],
+                "pixel_format": pixel_format,
+                "data": pixel_data,
+                "dtype": "uint8",
+                "order": "C",
+            }
+        })
+
+    # -------- IMAGE mode (PNG) --------
+    output = request.form.get("output", "mask").lower().strip()
+    if output not in ("mask", "overlay"):
+        return jsonify({"error": "output must be 'mask' or 'overlay'"}), 400
+
     if output == "mask":
         return send_file(
             io.BytesIO(mask_to_png_bytes(mask)),
@@ -171,7 +235,12 @@ def predict():
             download_name=f"{model_key}_mask.png",
         )
 
-    over = overlay_mask_on_image(resized_bgr, mask, alpha=0.45)
+    try:
+        alpha = float(request.form.get("alpha", "0.45"))
+    except ValueError:
+        return jsonify({"error": "alpha must be a float"}), 400
+
+    over, _palette = overlay_mask_on_image(resized_bgr, mask, alpha=alpha)
     ok, buf = cv2.imencode(".png", over)
     if not ok:
         return jsonify({"error": "failed to encode overlay"}), 500
