@@ -3,15 +3,65 @@ import io
 import cv2
 import numpy as np
 from flask import Flask, request, jsonify, send_file
-
+import os
+import requests
 from predictor import from_env, mask_to_base64_raw, mask_to_pixel_matrix, mask_to_pixel_flat, overlay_mask_on_image
 from coco_tree import build_tree_coco_from_mask
+from coco_obstruction import build_obstruction_coco_from_mask
+
 
 
 app = Flask(__name__)
 
 # Load models once at startup
 PRED = from_env()
+
+CROPPER_URL =  "http://localhost:5013/crop"
+CROPPER_TIMEOUT_SEC = 60
+
+def _decode_image_bytes_to_bgr(img_bytes: bytes) -> np.ndarray:
+    npbuf = np.frombuffer(img_bytes, dtype=np.uint8)
+    img = cv2.imdecode(npbuf, cv2.IMREAD_UNCHANGED)
+    if img is None:
+        raise ValueError("unable to decode image bytes")
+
+    # If cropper returns RGBA/ BGRA PNG, drop alpha (or composite if you want)
+    if img.ndim == 3 and img.shape[2] == 4:
+        img = img[:, :, :3]  # BGRA -> BGR by dropping alpha
+    return img
+
+CROPPER_URL = os.environ.get("CROPPER_URL", "http://localhost:5013/crop")
+CROPPER_TIMEOUT_SEC = float(os.environ.get("CROPPER_TIMEOUT_SEC", "60"))
+
+
+def _decode_image_bytes_to_bgr(img_bytes: bytes) -> np.ndarray:
+    npbuf = np.frombuffer(img_bytes, dtype=np.uint8)
+    img = cv2.imdecode(npbuf, cv2.IMREAD_UNCHANGED)
+    if img is None:
+        raise ValueError("unable to decode image bytes")
+
+    # If cropper returns RGBA/ BGRA PNG, drop alpha (or composite if you want)
+    if img.ndim == 3 and img.shape[2] == 4:
+        img = img[:, :, :3]  # BGRA -> BGR by dropping alpha
+    return img
+
+
+def call_crop_service(original_image_bytes: bytes) -> np.ndarray:
+    """
+    Calls crop API and returns cropped image as BGR numpy array.
+    Expects cropper to return image/png (RGBA is fine).
+    """
+    resp = requests.post(
+        CROPPER_URL,
+        files={"image": ("image.png", original_image_bytes, "application/octet-stream")},
+        timeout=CROPPER_TIMEOUT_SEC,
+    )
+
+    if resp.status_code != 200:
+        # Cropper sometimes returns JSON error; include it for debugging
+        raise RuntimeError(f"cropper failed: HTTP {resp.status_code} - {resp.text[:300]}")
+
+    return _decode_image_bytes_to_bgr(resp.content)
 
 
 def mask_to_png_bytes(mask_uint8: np.ndarray) -> bytes:
@@ -47,7 +97,7 @@ def predict():
       - alpha: float (default: 0.45)           [only when output=overlay]
     """
     model_key = request.args.get("model", "tree").lower().strip()
-
+    
     response_mode = request.args.get("response", "image").lower().strip()
     if response_mode not in ("image", "json", "pixel", "cocojson"):
         return jsonify({"error": "response must be 'image' or 'json' or 'pixel' or 'cocoJson'"}), 400
@@ -58,6 +108,15 @@ def predict():
     data = request.files["file"].read()
     if not data:
         return jsonify({"error": "empty file"}), 400
+        # --- cropMode handling (obstruction only) ---
+    crop_mode = request.args.get("cropMode", "false").strip().lower() in ("1", "true", "yes")
+
+    # Use original upload bytes for crop service (so it sees the true image)
+    if crop_mode and model_key in ("obstruction", "obstacle"):
+        try:
+            img_bgr = call_crop_service(data)  # now img_bgr becomes the cropped image
+        except Exception as e:
+            return jsonify({"error": f"cropMode failed: {str(e)}"}), 500
 
     npbuf = np.frombuffer(data, dtype=np.uint8)
     img_bgr = cv2.imdecode(npbuf, cv2.IMREAD_COLOR)
@@ -113,28 +172,41 @@ def predict():
         )
 
     # -------- COCO JSON mode (tree-only for now) --------
+    # -------- COCO JSON mode --------
     if response_mode == "cocojson":
-        if model_key != "tree":
-            return jsonify(
-                {
-                    "error": "cocoJson mode is currently supported only for model=tree. Obstruction flow will be added later."
-                }
-            ), 400
-
         save_debug = request.args.get("debug", "0").strip().lower() in ("1", "true", "yes")
         base_name = request.args.get("name", "image").strip() or "image"
 
-        coco = build_tree_coco_from_mask(
-            original_bgr=img_bgr,  # original image size
-            mask_uint8=mask,       # model input size mask
-            y_prob=prob_map,
-            num_classes=int(prob_map.shape[-1]),
-            save_debug=save_debug,
-            debug_dir="debug_tree",
-            base_name=base_name,
-        )
+        if model_key == "tree":
+            coco = build_tree_coco_from_mask(
+                original_bgr=img_bgr,
+                mask_uint8=mask,
+                y_prob=prob_map,
+                num_classes=int(prob_map.shape[-1]),
+                save_debug=save_debug,
+                debug_dir="debug_tree",
+                base_name=base_name,
+            )
+            return jsonify({"model": model_key, "input_size": {"h": int(input_h), "w": int(input_w)}, "coco": coco})
 
-        return jsonify({"model": model_key, "input_size": {"h": int(input_h), "w": int(input_w)}, "coco": coco})
+        if model_key in ("obstruction", "obstacle"):
+            
+            coco = build_obstruction_coco_from_mask(
+                original_bgr=img_bgr,
+                mask_uint8=mask,
+                y_prob=prob_map,
+                num_classes=int(prob_map.shape[-1]),
+                save_debug=save_debug,
+                debug_dir="debug_obstruction",
+                base_name=base_name,
+                background_class_id=0,
+                min_component_pixels=50,          # tune as needed
+                circle_circularity_thresh=0.72,   # tune as needed
+            )
+            return jsonify({"model": model_key, "input_size": {"h": int(input_h), "w": int(input_w)}, "coco": coco})
+
+        return jsonify({"error": "cocoJson supported for model=tree,obstruction,obstacle"}), 400
+
 
     # -------- IMAGE mode (PNG) --------
     output = request.form.get("output", "mask").lower().strip()
